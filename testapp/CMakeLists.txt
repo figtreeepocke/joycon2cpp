@@ -1,35 +1,38 @@
-cmake_minimum_required(VERSION 3.20)
-project(testapp LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.10)
+project(joycon2cpp)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
 
-if(MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
+# Linux-specific packages
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(BLUEZ REQUIRED bluez)
+pkg_check_modules(UDEV REQUIRED libudev)
 
-include_directories(
-  src
-  ${CMAKE_SOURCE_DIR}/include
+# Optional: SDL2 for controller output
+find_package(SDL2)
+
+# Add your source files
+add_executable(joycon2cpp
+    src/main.cpp
+    src/bluetooth_linux.cpp
+    src/virtual_controller_linux.cpp
+    # Add other source files
 )
 
-file(GLOB_RECURSE SRC_FILES
-  src/*.cpp
+# Include directories
+target_include_directories(joycon2cpp PRIVATE
+    ${BLUEZ_INCLUDE_DIRS}
+    ${UDEV_INCLUDE_DIRS}
 )
 
-add_executable(testapp ${SRC_FILES})
-
-target_link_directories(testapp PRIVATE ${CMAKE_SOURCE_DIR}/lib)
-target_link_libraries(testapp
-    PRIVATE
-        setupapi
-        hid
-        ViGEmClient
-        windowsapp
+# Link libraries
+target_link_libraries(joycon2cpp
+    ${BLUEZ_LIBRARIES}
+    ${UDEV_LIBRARIES}
+    pthread
+    # Add hidapi if using it
+    hidapi-hidraw
 )
 
-if(MSVC)
-  target_compile_options(testapp PRIVATE /W3 /permissive-)
-else()
-  target_compile_options(testapp PRIVATE -Wall -Wextra -pedantic)
-endif()
+# Compiler flags
+target_compile_options(joycon2cpp PRIVATE ${BLUEZ_CFLAGS_OTHER})

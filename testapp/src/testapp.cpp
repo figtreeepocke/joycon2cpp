@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.Streams.h>
@@ -547,3 +548,602 @@ int main()
 
     return 0;
 }
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/uinput.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <string>
+#include <cstring>
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <dirent.h>
+
+enum JoyConSide { Left, Right };
+enum JoyConOrientation { Upright, Sideways };
+
+static const uint16_t JOYCON_VENDOR_ID = 0x057e;
+static const uint16_t JOYCON_L_PRODUCT_ID = 0x2006;
+static const uint16_t JOYCON_R_PRODUCT_ID = 0x2007;
+static const uint16_t PRO_CONTROLLER_PRODUCT_ID = 0x2009;
+static const uint16_t NSO_GC_PRODUCT_ID = 0x200e;
+
+struct JoyConDevice {
+    std::string path;
+    int fd;
+    bool isPro;
+    bool isNSOGC;
+    JoyConSide side;
+    JoyConOrientation orientation;
+    bool partOfDual;
+};
+
+struct VirtualController {
+    int uinput_fd;
+    std::mutex write_mutex;
+};
+
+void emitEvent(int fd, uint16_t type, uint16_t code, int32_t value) {
+    struct input_event ie;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ie.time = tv;
+    ie.type = type;
+    ie.code = code;
+    ie.value = value;
+    if (write(fd, &ie, sizeof(ie)) < 0) {
+        std::cerr << "Failed to write uinput event." << std::endl;
+    }
+}
+
+void initializeVirtualController(VirtualController &vc) {
+    vc.uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (vc.uinput_fd < 0) {
+        perror("open /dev/uinput");
+        exit(1);
+    }
+    // Enable event types
+    ioctl(vc.uinput_fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(vc.uinput_fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(vc.uinput_fd, UI_SET_EVBIT, EV_SYN);
+    // Enable buttons
+    int keys[] = { BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST,
+                   BTN_TL, BTN_TR,
+                   BTN_SELECT, BTN_START,
+                   BTN_MODE,
+                   BTN_THUMBL, BTN_THUMBR };
+    for (int code : keys) {
+        ioctl(vc.uinput_fd, UI_SET_KEYBIT, code);
+    }
+    // Enable axes
+    int axes[] = { ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y };
+    for (int code : axes) {
+        ioctl(vc.uinput_fd, UI_SET_ABSBIT, code);
+    }
+    // Configure axis ranges
+    struct uinput_user_dev uidev;
+    memset(&uidev, 0, sizeof(uidev));
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Virtual JoyCon Controller");
+    uidev.id.bustype = BUS_USB;
+    uidev.id.vendor  = 0x057e;
+    uidev.id.product = 0x200e;
+    uidev.id.version = 0x0001;
+    // Left stick and right stick axes 0-65535
+    uidev.absmin[ABS_X] = 0;    uidev.absmax[ABS_X] = 65535;
+    uidev.absmin[ABS_Y] = 0;    uidev.absmax[ABS_Y] = 65535;
+    uidev.absmin[ABS_RX] = 0;   uidev.absmax[ABS_RX] = 65535;
+    uidev.absmin[ABS_RY] = 0;   uidev.absmax[ABS_RY] = 65535;
+    // Trigger axes 0-255
+    uidev.absmin[ABS_Z] = 0;    uidev.absmax[ABS_Z] = 255;
+    uidev.absmin[ABS_RZ] = 0;   uidev.absmax[ABS_RZ] = 255;
+    // D-Pad hat -1 to 1
+    uidev.absmin[ABS_HAT0X] = -1; uidev.absmax[ABS_HAT0X] = 1;
+    uidev.absmin[ABS_HAT0Y] = -1; uidev.absmax[ABS_HAT0Y] = 1;
+    // Write device configuration to uinput
+    if (write(vc.uinput_fd, &uidev, sizeof(uidev)) < 0) {
+        perror("write uidev");
+        exit(1);
+    }
+    if (ioctl(vc.uinput_fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE");
+        exit(1);
+    }
+    std::cout << "Virtual controller created via uinput." << std::endl;
+}
+
+// Helper to check if a device supports EV_KEY events (to filter out sensor-only interfaces)
+bool deviceHasKeys(int fd) {
+    unsigned long evbit[EV_MAX/ (8 * sizeof(unsigned long)) + 1];
+    memset(evbit, 0, sizeof(evbit));
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit) < 0) {
+        return false;
+    }
+    return evbit[EV_KEY / (8 * sizeof(unsigned long))] & (1UL << (EV_KEY % (8 * sizeof(unsigned long))));
+}
+
+static std::vector<std::string> usedDevices; // track used device paths to avoid duplicates
+
+std::string findDeviceByVendorProduct(uint16_t vendor, uint16_t product, bool requireKeys = true) {
+    DIR *dir = opendir("/dev/input");
+    if (!dir) {
+        perror("opendir /dev/input");
+        exit(1);
+    }
+    struct dirent *ent;
+    std::string result;
+    while ((ent = readdir(dir)) != NULL) {
+        std::string name = ent->d_name;
+        if (name.rfind("event", 0) == 0) {
+            std::string path = "/dev/input/" + name;
+            // Skip if already used
+            if (std::find(usedDevices.begin(), usedDevices.end(), path) != usedDevices.end()) {
+                continue;
+            }
+            int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+            if (fd < 0) continue;
+            struct input_id dev_id;
+            if (ioctl(fd, EVIOCGID, &dev_id) >= 0) {
+                if (dev_id.vendor == vendor && dev_id.product == product) {
+                    bool ok = true;
+                    if (requireKeys && !deviceHasKeys(fd)) {
+                        ok = false;
+                    }
+                    close(fd);
+                    if (ok) {
+                        result = path;
+                        break;
+                    }
+                }
+            }
+            close(fd);
+        }
+    }
+    closedir(dir);
+    return result;
+}
+
+JoyConDevice waitForJoyConDevice(uint16_t vendor, uint16_t product, JoyConSide side = Left, JoyConOrientation orientation = Upright, bool partOfDual = false) {
+    std::wcout << L"Waiting for device (vendor 0x" << std::hex << vendor << L", product 0x" << product << L")..." << std::endl;
+    std::string path;
+    for (int i = 0; i < 300; ++i) { // poll for up to 30 seconds
+        path = findDeviceByVendorProduct(vendor, product, true);
+        if (!path.empty()) break;
+        usleep(100000); // wait 100ms
+    }
+    if (path.empty()) {
+        std::wcerr << L"Timeout: device (vendor 0x" << std::hex << vendor << L", product 0x" << product << L") not found.\n";
+        exit(1);
+    }
+    usedDevices.push_back(path);
+    JoyConDevice jc;
+    jc.path = path;
+    jc.fd = open(path.c_str(), O_RDONLY);
+    if (jc.fd < 0) {
+        std::cerr << "Failed to open " << path << std::endl;
+        exit(1);
+    }
+    jc.isPro = (product == PRO_CONTROLLER_PRODUCT_ID);
+    jc.isNSOGC = (product == NSO_GC_PRODUCT_ID);
+    jc.side = side;
+    jc.orientation = orientation;
+    jc.partOfDual = partOfDual;
+    std::wcout << L"Found device " << path.c_str() << L" for Joy-Con/Controller.\n";
+    return jc;
+}
+
+int main() {
+    // Prompt number of players
+    int numPlayers;
+    std::cout << "How many players? ";
+    std::cin >> numPlayers;
+    std::cin.ignore();
+    std::vector<JoyConDevice> joyconDevices;
+    std::vector<VirtualController> virtualControllers;
+    virtualControllers.reserve(numPlayers);
+
+    for (int i = 0; i < numPlayers; ++i) {
+        std::wstring line;
+        int controllerType;
+        std::wcout << L"Player " << (i+1) << L":\n";
+        std::wcout << L"  What controller type? (1=Single JoyCon, 2=Dual JoyCon, 3=Pro Controller, 4=NSO GC Controller): ";
+        std::wcin >> controllerType;
+        std::wcin.ignore();
+        JoyConSide side;
+        JoyConOrientation orientation;
+        if (controllerType == 1) { // Single JoyCon
+            while (true) {
+                std::wcout << L"  Which side? (L=Left, R=Right): ";
+                std::getline(std::wcin, line);
+                if (line == L"L" || line == L"l" || line == L"R" || line == L"r") {
+                    side = (line[0] == L'L' || line[0] == L'l') ? Left : Right;
+                    break;
+                }
+                std::wcout << L"Invalid input. Please enter L or R.\n";
+            }
+            while (true) {
+                std::wcout << L"  What orientation? (U=Upright, S=Sideways): ";
+                std::getline(std::wcin, line);
+                if (line == L"U" || line == L"u" || line == L"S" || line == L"s") {
+                    orientation = (line[0] == L'S' || line[0] == L's') ? Sideways : Upright;
+                    break;
+                }
+                std::wcout << L"Invalid input. Please enter U or S.\n";
+            }
+            // Connect to the Joy-Con device
+            uint16_t prod = (side == Left ? JOYCON_L_PRODUCT_ID : JOYCON_R_PRODUCT_ID);
+            JoyConDevice jc = waitForJoyConDevice(JOYCON_VENDOR_ID, prod, side, orientation, false);
+            joyconDevices.push_back(jc);
+            // Create a virtual controller for this player
+            virtualControllers.emplace_back();
+            initializeVirtualController(virtualControllers.back());
+            // Spawn a thread to handle this Joy-Con's input events
+            JoyConDevice *jd = &joyconDevices.back();
+            VirtualController *vc = &virtualControllers.back();
+            std::thread([jd, vc]() {
+                struct input_event ev;
+                while (true) {
+                    ssize_t rb = read(jd->fd, &ev, sizeof(ev));
+                    if (rb <= 0) {
+                        if (rb < 0 && errno == EAGAIN) {
+                            // No immediate event, continue polling
+                            usleep(1000);
+                            continue;
+                        }
+                        break; // device disconnected or error
+                    }
+                    if (ev.type == EV_KEY) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        // Face buttons or D-Pad
+                        if (code == BTN_SOUTH || code == BTN_EAST || code == BTN_NORTH || code == BTN_WEST) {
+                            if (jd->side == Left && jd->orientation == Upright) {
+                                // Map D-Pad (Left Joy-Con upright) to hat axes
+                                if (code == BTN_WEST) { // left
+                                    emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0X, val ? -1 : 0);
+                                } else if (code == BTN_EAST) { // right
+                                    emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0X, val ? 1 : 0);
+                                } else if (code == BTN_NORTH) { // up
+                                    emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0Y, val ? -1 : 0);
+                                } else if (code == BTN_SOUTH) { // down
+                                    emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0Y, val ? 1 : 0);
+                                }
+                            } else {
+                                // For Joy-Con R upright, or any Joy-Con in sideways orientation, treat codes as regular face buttons
+                                emitEvent(vc->uinput_fd, EV_KEY, code, val);
+                            }
+                        }
+                        // Shoulder and trigger buttons
+                        else if (code == BTN_TL || code == BTN_TR || code == BTN_TL2 || code == BTN_TR2) {
+                            if (jd->orientation == Sideways) {
+                                // In sideways mode, ignore original L/ZL or R/ZR (not used as they are inaccessible in this orientation)
+                                continue;
+                            }
+                            if (code == BTN_TL) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_TL, val);
+                            } else if (code == BTN_TR) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_TR, val);
+                            } else if (code == BTN_TL2) {
+                                // Map ZL to analog trigger axis
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_Z, val ? 255 : 0);
+                            } else if (code == BTN_TR2) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_RZ, val ? 255 : 0);
+                            }
+                        }
+                        // SL/SR rail buttons on Joy-Con
+                        else if (code == BTN_C || code == BTN_Z) {
+                            if (jd->orientation == Sideways) {
+                                // In sideways orientation, map SL -> L (BTN_TL) and SR -> R (BTN_TR)
+                                if (code == BTN_C) {
+                                    emitEvent(vc->uinput_fd, EV_KEY, BTN_TL, val);
+                                } else if (code == BTN_Z) {
+                                    emitEvent(vc->uinput_fd, EV_KEY, BTN_TR, val);
+                                }
+                            }
+                            // In upright orientation, SL/SR are not used (ignore)
+                        }
+                        // Minus/Plus/Home buttons
+                        else if (code == BTN_SELECT || code == BTN_START || code == BTN_MODE) {
+                            if (code == BTN_SELECT) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_SELECT, val);
+                            } else if (code == BTN_START) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_START, val);
+                            } else if (code == BTN_MODE) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_MODE, val);
+                            }
+                        }
+                        // Stick clicks
+                        else if (code == BTN_THUMBL || code == BTN_THUMBR) {
+                            emitEvent(vc->uinput_fd, EV_KEY, code, val);
+                        }
+                        // Capture button (code 319) not mapped
+                    }
+                    else if (ev.type == EV_ABS) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == ABS_X || code == ABS_Y) {
+                            // Single Joy-Con (either left or right) uses its stick as the virtual left stick
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        } else if (code == ABS_RX || code == ABS_RY) {
+                            // Single Joy-Con should not produce RX/RY (no second stick), ignore if any
+                        } else if (code == ABS_HAT0X || code == ABS_HAT0Y) {
+                            // Forward hat events (if any) directly
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                    }
+                    else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        // Flush out a sync event after each batch
+                        emitEvent(vc->uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    }
+                }
+            }).detach();
+            std::wcout << L"Single Joy-Con configured. Press Enter to continue...\n";
+            std::wstring dummy;
+            std::getline(std::wcin, dummy);
+        }
+        else if (controllerType == 2) { // Dual Joy-Con
+            std::wcout << L"Player " << (i+1) << L": Please sync your RIGHT Joy-Con now.\n";
+            JoyConDevice rightJc = waitForJoyConDevice(JOYCON_VENDOR_ID, JOYCON_R_PRODUCT_ID, Right, Upright, true);
+            std::wcout << L"Please sync your LEFT Joy-Con now.\n";
+            JoyConDevice leftJc = waitForJoyConDevice(JOYCON_VENDOR_ID, JOYCON_L_PRODUCT_ID, Left, Upright, true);
+            joyconDevices.push_back(rightJc);
+            joyconDevices.push_back(leftJc);
+            // Create one virtual controller for this pair
+            virtualControllers.emplace_back();
+            initializeVirtualController(virtualControllers.back());
+            VirtualController *vc = &virtualControllers.back();
+            // References to the JoyCon devices
+            JoyConDevice *rd = &joyconDevices[joyconDevices.size() - 2]; // right Joy-Con
+            JoyConDevice *ld = &joyconDevices[joyconDevices.size() - 1]; // left Joy-Con
+            // Thread for left Joy-Con (handles D-Pad, L, ZL, etc.)
+            std::thread([ld, vc]() {
+                struct input_event ev;
+                while (true) {
+                    ssize_t rb = read(ld->fd, &ev, sizeof(ev));
+                    if (rb <= 0) {
+                        if (rb < 0 && errno == EAGAIN) {
+                            usleep(1000);
+                            continue;
+                        }
+                        break;
+                    }
+                    if (ev.type == EV_KEY) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == BTN_WEST || code == BTN_EAST || code == BTN_NORTH || code == BTN_SOUTH) {
+                            // Map Left Joy-Con D-Pad to virtual hat
+                            if (code == BTN_WEST) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0X, val ? -1 : 0);
+                            } else if (code == BTN_EAST) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0X, val ? 1 : 0);
+                            } else if (code == BTN_NORTH) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0Y, val ? -1 : 0);
+                            } else if (code == BTN_SOUTH) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_HAT0Y, val ? 1 : 0);
+                            }
+                        }
+                        else if (code == BTN_TL || code == BTN_TL2) {
+                            // Left Joy-Con L and ZL
+                            if (code == BTN_TL) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_TL, val);
+                            } else if (code == BTN_TL2) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_Z, val ? 255 : 0);
+                            }
+                        }
+                        else if (code == BTN_C || code == BTN_Z) {
+                            // Left Joy-Con SL/SR (not used in dual upright mode)
+                            continue;
+                        }
+                        else if (code == BTN_SELECT) {
+                            emitEvent(vc->uinput_fd, EV_KEY, BTN_SELECT, val);
+                        }
+                        else if (code == BTN_THUMBL) {
+                            emitEvent(vc->uinput_fd, EV_KEY, BTN_THUMBL, val);
+                        }
+                        // Ignore capture (319) if present
+                    }
+                    else if (ev.type == EV_ABS) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == ABS_X || code == ABS_Y) {
+                            // Left Joy-Con analog -> virtual left stick
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        } else if (code == ABS_HAT0X || code == ABS_HAT0Y) {
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                    }
+                    else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        emitEvent(vc->uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    }
+                }
+            }).detach();
+            // Thread for right Joy-Con (handles ABXY, R, ZR, etc.)
+            std::thread([rd, vc]() {
+                struct input_event ev;
+                while (true) {
+                    ssize_t rb = read(rd->fd, &ev, sizeof(ev));
+                    if (rb <= 0) {
+                        if (rb < 0 && errno == EAGAIN) {
+                            usleep(1000);
+                            continue;
+                        }
+                        break;
+                    }
+                    if (ev.type == EV_KEY) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == BTN_SOUTH || code == BTN_EAST || code == BTN_NORTH || code == BTN_WEST) {
+                            // Map Right Joy-Con face buttons A/B/X/Y directly
+                            emitEvent(vc->uinput_fd, EV_KEY, code, val);
+                        }
+                        else if (code == BTN_TR || code == BTN_TR2) {
+                            if (code == BTN_TR) {
+                                emitEvent(vc->uinput_fd, EV_KEY, BTN_TR, val);
+                            } else if (code == BTN_TR2) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_RZ, val ? 255 : 0);
+                            }
+                        }
+                        else if (code == BTN_Z || code == BTN_C) {
+                            // Right Joy-Con SL/SR not used in dual mode
+                            continue;
+                        }
+                        else if (code == BTN_START) {
+                            emitEvent(vc->uinput_fd, EV_KEY, BTN_START, val);
+                        }
+                        else if (code == BTN_MODE) {
+                            emitEvent(vc->uinput_fd, EV_KEY, BTN_MODE, val);
+                        }
+                        else if (code == BTN_THUMBR) {
+                            emitEvent(vc->uinput_fd, EV_KEY, BTN_THUMBR, val);
+                        }
+                    }
+                    else if (ev.type == EV_ABS) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == ABS_X || code == ABS_Y) {
+                            // Right Joy-Con analog -> virtual right stick (remap ABS_X->ABS_RX, ABS_Y->ABS_RY)
+                            if (code == ABS_X) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_RX, val);
+                            } else if (code == ABS_Y) {
+                                emitEvent(vc->uinput_fd, EV_ABS, ABS_RY, val);
+                            }
+                        }
+                        // Right Joy-Con has no D-pad, ignore hat events if any
+                    }
+                    else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        emitEvent(vc->uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    }
+                }
+            }).detach();
+            std::wcout << L"Dual Joy-Cons connected and configured. Press Enter to continue...\n";
+            std::wstring dummy;
+            std::getline(std::wcin, dummy);
+        }
+        else if (controllerType == 3) { // Pro Controller
+            std::wcout << L"Player " << (i+1) << L": Please sync your Pro Controller now.\n";
+            JoyConDevice proDev = waitForJoyConDevice(JOYCON_VENDOR_ID, PRO_CONTROLLER_PRODUCT_ID, Left, Upright, false);
+            joyconDevices.push_back(proDev);
+            virtualControllers.emplace_back();
+            initializeVirtualController(virtualControllers.back());
+            VirtualController *vc = &virtualControllers.back();
+            JoyConDevice *pd = &joyconDevices.back();
+            std::thread([pd, vc]() {
+                struct input_event ev;
+                while (true) {
+                    ssize_t rb = read(pd->fd, &ev, sizeof(ev));
+                    if (rb <= 0) {
+                        if (rb < 0 && errno == EAGAIN) {
+                            usleep(1000);
+                            continue;
+                        }
+                        break;
+                    }
+                    if (ev.type == EV_KEY) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == BTN_SOUTH || code == BTN_EAST || code == BTN_NORTH || code == BTN_WEST ||
+                            code == BTN_TL || code == BTN_TR ||
+                            code == BTN_SELECT || code == BTN_START || code == BTN_MODE ||
+                            code == BTN_THUMBL || code == BTN_THUMBR) {
+                            emitEvent(vc->uinput_fd, EV_KEY, code, val);
+                        }
+                        else if (code == BTN_TL2) {
+                            emitEvent(vc->uinput_fd, EV_ABS, ABS_Z, val ? 255 : 0);
+                        }
+                        else if (code == BTN_TR2) {
+                            emitEvent(vc->uinput_fd, EV_ABS, ABS_RZ, val ? 255 : 0);
+                        }
+                        // Ignore capture (if present) for simplicity
+                    }
+                    else if (ev.type == EV_ABS) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == ABS_X || code == ABS_Y || code == ABS_RX || code == ABS_RY) {
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                        else if (code == ABS_HAT0X || code == ABS_HAT0Y) {
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                    }
+                    else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        emitEvent(vc->uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    }
+                }
+            }).detach();
+            std::wcout << L"Pro Controller connected and configured. Press Enter to continue...\n";
+            std::wstring dummy;
+            std::getline(std::wcin, dummy);
+        }
+        else if (controllerType == 4) { // NSO GameCube Controller
+            std::wcout << L"Player " << (i+1) << L": Please sync your NSO GameCube Controller now.\n";
+            JoyConDevice gcDev = waitForJoyConDevice(JOYCON_VENDOR_ID, NSO_GC_PRODUCT_ID, Left, Upright, false);
+            joyconDevices.push_back(gcDev);
+            virtualControllers.emplace_back();
+            initializeVirtualController(virtualControllers.back());
+            VirtualController *vc = &virtualControllers.back();
+            JoyConDevice *gd = &joyconDevices.back();
+            std::thread([gd, vc]() {
+                struct input_event ev;
+                while (true) {
+                    ssize_t rb = read(gd->fd, &ev, sizeof(ev));
+                    if (rb <= 0) {
+                        if (rb < 0 && errno == EAGAIN) {
+                            usleep(1000);
+                            continue;
+                        }
+                        break;
+                    }
+                    if (ev.type == EV_KEY) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == BTN_SOUTH || code == BTN_EAST || code == BTN_NORTH || code == BTN_WEST ||
+                            code == BTN_TL || code == BTN_TR ||
+                            code == BTN_SELECT || code == BTN_START || code == BTN_MODE ||
+                            code == BTN_THUMBL || code == BTN_THUMBR) {
+                            emitEvent(vc->uinput_fd, EV_KEY, code, val);
+                        }
+                        else if (code == BTN_TL2) {
+                            emitEvent(vc->uinput_fd, EV_ABS, ABS_Z, val ? 255 : 0);
+                        }
+                        else if (code == BTN_TR2) {
+                            emitEvent(vc->uinput_fd, EV_ABS, ABS_RZ, val ? 255 : 0);
+                        }
+                    }
+                    else if (ev.type == EV_ABS) {
+                        uint16_t code = ev.code;
+                        int32_t val = ev.value;
+                        if (code == ABS_X || code == ABS_Y || code == ABS_RX || code == ABS_RY) {
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                        else if (code == ABS_HAT0X || code == ABS_HAT0Y) {
+                            emitEvent(vc->uinput_fd, EV_ABS, code, val);
+                        }
+                    }
+                    else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        emitEvent(vc->uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    }
+                }
+            }).detach();
+            std::wcout << L"NSO GameCube Controller connected and configured. Press Enter to continue...\n";
+            std::wstring dummy;
+            std::getline(std::wcin, dummy);
+        }
+    }
+    std::wcout << L"All players connected. Press Enter to exit...\n";
+    std::wstring dummy;
+    std::getline(std::wcin, dummy);
+    // Cleanup: close input fds and destroy uinput devices
+    for (auto &jd : joyconDevices) {
+        if (jd.fd >= 0) close(jd.fd);
+    }
+    for (auto &vc : virtualControllers) {
+        ioctl(vc.uinput_fd, UI_DEV_DESTROY);
+        close(vc.uinput_fd);
+    }
+    return 0;
+}
+#endif
